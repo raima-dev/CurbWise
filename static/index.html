@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CurbWise</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  :root { --ink:#1B2A41; --route:#0B6BCB; --plain:#8A6FBF; --hazard:#D1495B; --panel:#F7F9FC; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"Atkinson Hyperlegible", system-ui, sans-serif; color:var(--ink); }
+  #map { position:fixed; inset:0; }
+  #panel { position:fixed; left:0; right:0; bottom:0; background:var(--panel); padding:16px; border-radius:18px 18px 0 0;
+           box-shadow:0 -4px 20px rgba(27,42,65,.18); max-width:560px; margin:0 auto; }
+  #say { font-size:1.35rem; font-weight:700; min-height:3.2em; margin:0 0 12px; line-height:1.35; }
+  .row { display:flex; gap:10px; margin-bottom:10px; }
+  button, select { font:inherit; font-size:1.1rem; min-height:56px; border-radius:12px; border:2px solid var(--ink);
+                   background:#fff; color:var(--ink); padding:0 14px; flex:1; }
+  button.go { background:var(--route); border-color:var(--route); color:#fff; font-weight:700; }
+  button.on { background:var(--ink); color:#fff; }
+  :focus-visible { outline:4px solid #F2B705; outline-offset:2px; }
+  small { display:block; opacity:.75; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <p id="say" role="status" aria-live="polite">Tap the map to set your start, then your destination.</p>
+  <div class="row">
+    <select id="profile" aria-label="Who is travelling">
+      <option value="manual_wheelchair">Manual wheelchair</option>
+      <option value="power_wheelchair">Power wheelchair</option>
+      <option value="stroller">Stroller</option>
+    </select>
+    <button id="mode" class="on">Setting route</button>
+  </div>
+  <div class="row">
+    <button id="go" class="go">Find route</button>
+    <button id="again">Repeat (Space)</button>
+  </div>
+  <div class="row">
+    <button id="report">Report a hazard with a photo</button>
+  </div>
+  <input type="file" id="photo" accept="image/*" capture="environment" hidden>
+  <small>Blue: accessible route. Purple dashed: standard walking route.</small>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = new maplibregl.Map({
+  container: "map", center: [-83.2330, 42.3189], zoom: 15.5,
+  style: { version: 8, sources: { osm: { type: "raster", tileSize: 256, attribution: "© OpenStreetMap contributors",
+    tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"] } }, layers: [{ id: "osm", type: "raster", source: "osm" }] }
+});
+let start = null, end = null, mode = "route", lastSpeech = "", markers = [];
+
+// ---- output on three channels: voice, vibration, large text. Each one can fail on its own. ----
+async function announce(text, buzz = [200]) {
+  lastSpeech = text;
+  $("say").textContent = text;                       // channel 1: big text (always works)
+  if (navigator.vibrate) navigator.vibrate(buzz);    // channel 2: vibration (Android Chrome; not iPhone Safari)
+  try {                                              // channel 3: ElevenLabs voice, then browser voice if it fails
+    const r = await fetch("/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    if (!r.ok) throw 0;
+    new Audio(URL.createObjectURL(await r.blob())).play();
+  } catch { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(text)); }
+}
+
+function pin(lngLat, color) {
+  markers.push(new maplibregl.Marker({ color }).setLngLat(lngLat).addTo(map));
+}
+function drawLine(id, geometry, color, dashed) {
+  if (map.getLayer(id)) { map.removeLayer(id); map.removeSource(id); }
+  map.addSource(id, { type: "geojson", data: { type: "Feature", geometry } });
+  map.addLayer({ id, type: "line", source: id, paint: { "line-color": color, "line-width": dashed ? 4 : 7,
+    ...(dashed ? { "line-dasharray": [2, 2] } : {}) } });
+}
+
+map.on("click", e => {
+  const p = [e.lngLat.lng, e.lngLat.lat];
+  if (mode === "hazard") { $("photo").dataset.lat = p[1]; $("photo").dataset.lon = p[0]; $("photo").click(); return; }
+  if (!start || (start && end)) { start = p; end = null; markers.forEach(m => m.remove()); markers = []; pin(p, "#1B2A41"); announce("Start set. Tap your destination.", [80]); }
+  else { end = p; pin(p, "#0B6BCB"); announce("Destination set. Press Find route.", [80]); }
+});
+
+$("go").onclick = async () => {
+  if (!start || !end) return announce("Set a start and a destination first.");
+  try {
+    const r = await fetch("/route", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start, end, profile: $("profile").value }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail);
+    if (d.normal) drawLine("normal", d.normal.line, "#8A6FBF", true);
+    drawLine("access", d.accessible.line, "#0B6BCB", false);
+    d.hazards.forEach(h => pin([h.lon, h.lat], "#D1495B"));
+    localStorage.setItem("lastRoute", JSON.stringify(d));   // offline fallback
+    announce(d.speech, d.hazards.length ? [300, 100, 300] : [200]);
+  } catch (err) {
+    const saved = localStorage.getItem("lastRoute");        // server unreachable: reuse the last route
+    if (saved) { const d = JSON.parse(saved); drawLine("access", d.accessible.line, "#0B6BCB", false); announce("Offline. Showing your last saved route. " + d.speech); }
+    else announce(err.message || "Could not reach the server.");
+  }
+};
+
+$("again").onclick = () => announce(lastSpeech || "Nothing to repeat yet.");
+document.addEventListener("keydown", e => { if (e.code === "Space" && e.target.tagName === "BODY") { e.preventDefault(); $("again").click(); } });
+
+$("mode").onclick = () => { mode = mode === "route" ? "hazard" : "route"; $("mode").textContent = mode === "route" ? "Setting route" : "Tap map to place hazard"; $("mode").classList.toggle("on", mode === "route"); };
+$("report").onclick = () => { mode = "hazard"; $("mode").textContent = "Tap map to place hazard"; $("mode").classList.remove("on"); announce("Tap the map where the hazard is, then take a photo."); };
+
+$("photo").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const fd = new FormData(); fd.append("photo", f); fd.append("lat", e.target.dataset.lat); fd.append("lon", e.target.dataset.lon);
+  announce("Checking your photo.");
+  const r = await fetch("/hazard", { method: "POST", body: fd }); const d = await r.json();
+  e.target.value = ""; mode = "route"; $("mode").textContent = "Setting route"; $("mode").classList.add("on");
+  if (!r.ok) return announce(d.detail);
+  announce(`Hazard saved: ${d.note} Press Find route to update your route.`, [300, 100, 300]);
+};
+</script>
+</body>
+</html>
