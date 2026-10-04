@@ -1,4 +1,4 @@
-import os, json, time, sqlite3
+import os, json, time, math, sqlite3
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import Response
@@ -9,8 +9,8 @@ from google.genai import types
 
 ORS_KEY = os.getenv("ORS_API_KEY")
 EL_KEY = os.getenv("ELEVENLABS_API_KEY")
-EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # check current model name
+EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 gem = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI()
@@ -37,33 +37,17 @@ def active_hazards():
     rows = db.execute("select id,type,severity,lat,lon,note from hazards where expires > ?", (time.time(),)).fetchall()
     return [dict(id=r[0], type=r[1], severity=r[2], lat=r[3], lon=r[4], note=r[5]) for r in rows]
 
-class TTSReq(BaseModel):
-    text: str
 
-@app.post("/tts")
-def tts(q: TTSReq):
-    try:
-        r = httpx.post(f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
-                       headers={"xi-api-key": EL_KEY or ""},
-                       json={"text": q.text[:500], "model_id": "eleven_multilingual_v2"}, timeout=20)
-    except Exception as e:
-        print("ELEVENLABS ERROR:", e)
-        raise HTTPException(502, "Voice unavailable")
-    if r.status_code != 200:
-        print("ELEVENLABS ERROR:", r.status_code, r.text)
-        raise HTTPException(502, "Voice unavailable")
-    return Response(r.content, media_type="audio/mpeg")
-
-# @app.post("/hazard")
-# async def add_hazard(photo: UploadFile = File(...), lat: float = Form(...), lon: float = Form(...)):
-#     data = await photo.read()
-#     if len(data) > 5_000_000:
-#         raise HTTPException(413, "Photo is over 5 MB. Try a smaller one.")
-#     resp = gem.models.generate_content(
-#         model=GEMINI_MODEL,
-#         contents=[types.Part.from_bytes(data=data, mime_type=photo.content_type or "image/jpeg"), PROMPT],
-#         config=types.GenerateContentConfig(response_mime_type="application/json"),
-#     )
+@app.post("/hazard")
+async def add_hazard(photo: UploadFile = File(...), lat: float = Form(...), lon: float = Form(...)):
+    data = await photo.read()
+    if len(data) > 5_000_000:
+        raise HTTPException(413, "Photo is over 5 MB. Try a smaller one.")
+    resp = gem.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[types.Part.from_bytes(data=data, mime_type=photo.content_type or "image/jpeg"), PROMPT],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
     try:
         r = json.loads(resp.text)
     except Exception:
@@ -98,24 +82,48 @@ def ors(profile, body):
     return {"line": f["geometry"], "summary": f["properties"]["summary"]}
 
 
+def near_line(h, line, meters=30):
+    """True if hazard h is within `meters` of the route line (list of [lon, lat])."""
+    k = 111320  # meters per degree of latitude
+    cx = math.cos(math.radians(h["lat"])) * k
+    px, py = h["lon"] * cx, h["lat"] * k
+    best = 1e9
+    for a, b in zip(line, line[1:]):
+        ax, ay, bx, by = a[0] * cx, a[1] * k, b[0] * cx, b[1] * k
+        dx, dy = bx - ax, by - ay
+        t = 0 if (dx == 0 and dy == 0) else max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        best = min(best, math.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+    return best <= meters
+
+
 @app.post("/route")
 def route(q: RouteReq):
     coords = {"coordinates": [q.start, q.end]}
-    avoid = [h for h in active_hazards() if h["severity"] >= 3]
-    d = 0.0001  # about 10 m box around each hazard
-    polys = [[[[h["lon"] - d, h["lat"] - d], [h["lon"] + d, h["lat"] - d], [h["lon"] + d, h["lat"] + d],
-               [h["lon"] - d, h["lat"] + d], [h["lon"] - d, h["lat"] - d]]] for h in avoid]
-    opts = {"profile_params": {"restrictions": PROFILES.get(q.profile, PROFILES["manual_wheelchair"])}}
-    if polys:
-        opts["avoid_polygons"] = {"type": "MultiPolygon", "coordinates": polys}
-    access = ors("wheelchair", {**coords, "options": opts})
+    restr = {"profile_params": {"restrictions": PROFILES.get(q.profile, PROFILES["manual_wheelchair"])}}
     normal = ors("foot-walking", coords)
+    access = ors("wheelchair", {**coords, "options": restr})
     if not access:
         raise HTTPException(404, "No accessible route found between these points.")
+
+    # only hazards within 30 m of the route we would otherwise take
+    hits = [h for h in active_hazards()
+            if h["severity"] >= 3 and near_line(h, access["line"]["coordinates"])]
+    avoided = False
+    if hits:
+        d = 0.0001  # about 10 m box around each hazard
+        polys = [[[[h["lon"] - d, h["lat"] - d], [h["lon"] + d, h["lat"] - d], [h["lon"] + d, h["lat"] + d],
+                   [h["lon"] - d, h["lat"] + d], [h["lon"] - d, h["lat"] - d]]] for h in hits]
+        rerouted = ors("wheelchair", {**coords, "options": {**restr, "avoid_polygons": {"type": "MultiPolygon", "coordinates": polys}}})
+        if rerouted:
+            access, avoided = rerouted, True
+
     mins = round(access["summary"]["duration"] / 60)
     text = f"Route found. {round(access['summary']['distance'])} meters, about {mins} minutes."
-    if avoid:
-        text += f" Avoiding {len(avoid)} reported hazard{'s' if len(avoid) > 1 else ''}: " + "; ".join(h["note"] for h in avoid[:3])
+    notes = "; ".join(h["note"] for h in hits[:3])
+    if hits and avoided:
+        text += f" Avoiding {len(hits)} reported hazard{'s' if len(hits) > 1 else ''} on the usual route: {notes}"
+    elif hits:
+        text += f" Warning: this route passes near a reported hazard and no way around was found: {notes}"
     return {"accessible": access, "normal": normal, "speech": text, "hazards": active_hazards()}
 
 
@@ -127,10 +135,13 @@ class TTSReq(BaseModel):
 def tts(q: TTSReq):
     try:
         r = httpx.post(f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}",
-                       headers={"xi-api-key": EL_KEY},
+                       headers={"xi-api-key": EL_KEY or ""},
                        json={"text": q.text[:500], "model_id": "eleven_multilingual_v2"}, timeout=20)
-        r.raise_for_status()
-    except Exception:
+    except Exception as e:
+        print("ELEVENLABS ERROR:", e)
+        raise HTTPException(502, "Voice unavailable")
+    if r.status_code != 200:
+        print("ELEVENLABS ERROR:", r.status_code, r.text)
         raise HTTPException(502, "Voice unavailable")  # the page falls back to browser speech
     return Response(r.content, media_type="audio/mpeg")
 
